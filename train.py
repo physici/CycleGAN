@@ -7,6 +7,8 @@ from tensorflow_addons.layers import InstanceNormalization
 
 import numpy as np
 import pandas as pd
+from numpy.typing import NDArray
+from typing import List, Tuple
 from random import sample
 from skimage import io
 from skimage.transform import resize
@@ -29,20 +31,62 @@ epochs = 10
 steps = round(no_imgs / n_batch)
 
 
-def preprocess(records):
+def preprocess(records: tf.data.Dataset) -> tf.data.Dataset:
+    """
+    Pre-processing of the Tensorflow-Datasets by scaling the 8bit-range to
+    float numbers between 0 and 1.
+
+    Parameters
+    ----------
+    records : Tensorflow Dataset
+        The training images
+
+    Returns
+    -------
+    Tensorflow Dataset
+        The scaled images.
+    """
     images = records["image"]
     images = tf.cast(images, tf.float32) / 255.0
     return images
 
 
-def tf_pipeline(dataset):
-    dataset = tf.data.Dataset.from_tensor_slices({"image": dataset})
-    dataset = dataset.map(preprocess)
-    dataset = dataset.repeat().shuffle(100).batch(16).prefetch(1)
-    return dataset
+def tf_pipeline(dataset: List[NDArray[np.uint8]]) -> tf.data.Dataset:
+    """
+    Create a pre-processing pipeline for training of the algorithm
+
+    Parameters
+    ----------
+    dataset : List
+        List of training images
+
+    Returns
+    -------
+    Tensorflow Dataset
+        Training images in Tensorflow format
+    """
+    data = tf.data.Dataset.from_tensor_slices({"image": dataset})
+    data = data.map(preprocess)
+    data = data.repeat().shuffle(100).batch(16).prefetch(1)
+    return data
 
 
-def tf_data(root, img_count=no_imgs):
+def load_data(root: Path, img_count: int = no_imgs):
+    """
+    Load training images from hard disk
+
+    Parameters
+    ----------
+    root : pathlib.Path
+        Path to the directory with the training images
+    img_count : int, optional
+        number of images that should be loaded.
+
+    Returns
+    -------
+    iterator
+        iterators over the loaded images
+    """
     trainingA = []
     df = pd.read_csv(root / "meta.csv")
     selection = df.query("type == 'template'")
@@ -68,9 +112,31 @@ def tf_data(root, img_count=no_imgs):
     return a.__iter__(), b.__iter__()
 
 
-def discriminator(input_dim, depth, kernel):
+def discriminator(
+    input_dim: Tuple[int, int, int], depth: int, kernel: int
+) -> models.Sequential:
+    """
+    Discriminator of the GAN
+
+    Parameters
+    ----------
+    input_dim : Tuple[int, int, int]
+        Dimension of the input images: height, width, color channels
+    depth : int
+        Number of convolution blocks in the discriminator
+    kernel : int
+        Size of the convolution kernel
+
+    Returns
+    -------
+    models.Sequential
+        Keras sequential model
+    """
     my_layers = []
     my_layers.append(layers.Input(shape=input_dim))
+    # downsample the image
+    # Instance Normalization is required as we do not have pairs of images
+    # each images need to be regarded as an individual, not being part of a set
     for i in range(1, depth):
         my_layers.append(layers.Conv2D(16 * i, kernel_size=kernel))
         my_layers.append(InstanceNormalization())
@@ -82,21 +148,45 @@ def discriminator(input_dim, depth, kernel):
     return my_model
 
 
-def generator(input_dim, depth, kernel):
+def generator(
+    input_dim: Tuple[int, int, int], depth: int, kernel: int
+) -> models.Sequential:
+    """
+    Generator of the GAN
+
+    Parameters
+    ----------
+    input_dim : Tuple[int, int, int]
+        Dimension of the input images: height, width, color channels
+    depth : int
+        Number of convolution blocks in the discriminator
+    kernel : int
+        Size of the convolution kernel
+
+    Returns
+    -------
+    models.Sequential
+        Keras sequential model
+    """
     my_layers = []
     my_layers.append(layers.Input(shape=input_dim))
+    # downsample the image
+    # Instance Normalization is required as we do not have pairs of images
+    # each images needs to be regarded as an individual, not being part of a set
     for i in range(1, depth):
         my_layers.append(layers.Conv2D(16 * i, kernel_size=kernel))
         my_layers.append(InstanceNormalization())
         my_layers.append(layers.Activation("relu"))
         my_layers.append(layers.Dropout(0.2))
 
+    # upsample the features again
     for i in range(1, depth):
         my_layers.append(layers.Conv2DTranspose(16 * i, kernel_size=kernel))
         my_layers.append(InstanceNormalization())
         my_layers.append(layers.Activation("relu"))
         my_layers.append(layers.Dropout(0.2))
 
+    # ensure that the output data has the shape (128, 128) and a single color channel only
     resizer = lambda name: layers.Lambda(
         lambda images: tf.image.resize(images, [128, 128]), name=name
     )
@@ -106,24 +196,52 @@ def generator(input_dim, depth, kernel):
     return model
 
 
-def composite_model(g1, d, g2, image_dim):
+def composite_model(
+    g1: models.Sequential,
+    d: models.Sequential,
+    g2: models.Sequential,
+    image_dim: Tuple[int, int, int],
+):
+    """
+    That's the Cycle in the CycleGan.
+    Forward transformation A->B, using the discriminator and the identity loss.
+    Then backward transformation B->A, using a cycle-loss value to estimate performance.
+
+    Parameters
+    ----------
+    g1 : models.Sequential
+        _description_
+    d : models.Sequential
+        _description_
+    g2 : models.Sequential
+        _description_
+    image_dim : Tuple[int, int, int]
+        _description_
+
+    Returns
+    -------
+    _type_
+        _description_
+    """
+
+    # we can only train one generator per cycle
     g1.trainable = True
     g2.trainable = False
     d.trainable = False
 
-    # Adversarial loss
+    # Forward A-> B, Adversarial loss
     input_img = layers.Input(shape=input_dim)
     g1_out = g1(input_img)
     d_out = d(g1_out)
 
-    # identity loss
+    # Forward A-> B, identity loss
     input_id = layers.Input(shape=input_dim)
     g1_out_id = g1(input_id)
 
-    # Cycle Loss, Forward cycle
+    # Backward B->A
     g2_out = g2(g1_out)
 
-    # Cycle Loss, Backward-cycle
+    # Backward B->A, Cycle Loss
     g2_out_id = g2(input_id)
     output_g1 = g1(g2_out_id)
 
@@ -136,32 +254,94 @@ def composite_model(g1, d, g2, image_dim):
     return model
 
 
-def generate_real(dataset, batch_size, patch_size):
+def generate_real(
+    dataset: tf.data.Dataset, batch_size: int, patch_size: int
+) -> Tuple[tf.data.Dataset, NDArray[np.float_]]:
+    """
+    Create labels (real - 1 or fake - 0) for each image to help during training.
+
+    Parameters
+    ----------
+    dataset : tf.data.Dataset
+        Image dataset
+    batch_size : int
+        Batch size during training
+    patch_size : int
+
+
+    Returns
+    -------
+    Tuple[tf.data.Dataset, NDArray[np.float]]
+        Dataset and labels
+    """
     labels = np.ones((batch_size, patch_size, patch_size, 1))
     return dataset, labels
 
 
-def generate_fake(dataset, g, batch_size, patch_size):
+def generate_fake(
+    dataset: tf.data.Dataset, g: models.Sequential, batch_size: int, patch_size: int
+) -> Tuple[tf.data.Dataset, NDArray[np.float_]]:
+    """
+    Create labels (real - 1 or fake - 0) for each image to help during training.
+
+    Parameters
+    ----------
+    dataset : tf.data.Dataset
+        Image dataset
+    g : models.Sequential
+        Generator to create the fake images
+    batch_size : int
+        Batch size during training
+    patch_size : int
+
+    Returns
+    -------
+    Tuple[tf.data.Dataset, NDArray[np.float]]
+        Dataset and labels
+    """
     predicted = g(dataset)
     labels = np.zeros((batch_size, patch_size, patch_size, 1))
     return predicted, labels
 
 
 def train(
-    discriminator_A,
-    discriminator_B,
-    generator_A_B,
-    generator_B_A,
-    composite_A_B,
-    composite_B_A,
-    epochs,
-    batch_size,
-    steps,
-    n_patch,
-):
+    discriminator_A: models.Sequential,
+    discriminator_B: models.Sequential,
+    generator_A_B: models.Sequential,
+    generator_B_A: models.Sequential,
+    composite_A_B: models.Sequential,
+    composite_B_A: models.Sequential,
+    epochs: int,
+    batch_size: int,
+    steps: int,
+    n_patch: int,
+) -> None:
+    """
+    Training of the CycleGAN
 
-    checkpoint_dir = "./outputs"
-    checkpoint_prefix = os.path.join(checkpoint_dir, "ckpt")
+    Parameters
+    ----------
+    discriminator_A : models.Sequential
+        Discriminator for the GAN A->B
+    discriminator_B : models.Sequential
+        Discriminator for the GAN B->A
+    generator_A_B : models.Sequential
+        Generator for GAN A->B
+    generator_B_A : models.Sequential
+        Generator for GAN B->A
+    composite_A_B : models.Sequential
+        CycleGAN A->B
+    composite_B_A : models.Sequential
+        CycleGAN B->A
+    epochs : int
+        Number of epochs for training
+    batch_size : int
+        Batch size per training step
+    steps : int
+        Number of steps per epoch
+    n_patch : int
+    """
+    # create a checkpoint for safekeeping of the intermediate results
     checkpoint = tf.train.Checkpoint(
         generator_A_B=generator_A_B,
         generator_B_A=generator_B_A,
@@ -170,9 +350,10 @@ def train(
         composite_A_B=composite_A_B,
         composite_B_A=composite_B_A,
     )
-    manager = tf.train.CheckpointManager(checkpoint, "cyclegan", max_to_keep=3)
+    manager = tf.train.CheckpointManager(checkpoint, "checkpoints", max_to_keep=3)
     checkpoint.restore(manager.latest_checkpoint)
 
+    # that's the actual training
     for epoch in range(1, epochs):
         for step in range(1, steps):
             print(epoch, step)
@@ -206,8 +387,9 @@ def train(
 
 
 if __name__ == "__main__":
+    print("Load Data")
     root = Path("./train/")
-    trainA, trainB = tf_data(root)
+    trainA, trainB = load_data(root)
 
     discriminator_A = discriminator(input_dim, depth, kernel)
     discriminator_B = discriminator(input_dim, depth, kernel)
@@ -215,13 +397,16 @@ if __name__ == "__main__":
     generator_A_B = generator(input_dim, depth, kernel)
     generator_B_A = generator(input_dim, depth, kernel)
 
+    # CycleGAN, for Training generator A->B
     composite_A_B = composite_model(
         generator_A_B, discriminator_B, generator_B_A, input_dim
     )
+    # CycleGAN, for Training generator B->A
     composite_B_A = composite_model(
         generator_B_A, discriminator_A, generator_A_B, input_dim
     )
 
+    print("Start Training")
     train(
         discriminator_A,
         discriminator_B,
