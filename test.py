@@ -30,11 +30,12 @@ steps = round(no_imgs / n_batch)
 
 if __name__ == "__main__":
     root = Path("./test/")
-    testA, testB = tf_data(root)
+    testA, testB = load_data(root)
 
     generator_A_B = generator(input_dim, depth, kernel)
     generator_B_A = generator(input_dim, depth, kernel)
 
+    # load checkpoint
     checkpoint = tf.train.Checkpoint(
         generator_A_B=generator_A_B,
         generator_B_A=generator_B_A,
